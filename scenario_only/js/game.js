@@ -115,7 +115,13 @@ async function initGame() {
     return;
   }
 
-  renderScene(0);
+  const saved = _getItem(STORAGE_KEYS.GAME_RESPONSES) || [];
+  const nextIndex = currentGame.scenes.findIndex(function (scene) {
+    return !saved.some(function (response) {
+      return response.scene_id === scene.scene_id && normalizeGameKey(response.game_key) === currentGame.key;
+    });
+  });
+  renderScene(nextIndex < 0 ? currentGame.scenes.length : nextIndex);
 }
 
 function renderScene(index) {
@@ -287,8 +293,9 @@ async function finishGame() {
 }
 
 document.addEventListener('DOMContentLoaded', async function () {
-  if (!localStorage.getItem('participant_id')) {
-    await startParticipantSession();
+  if (!localStorage.getItem('participant_id') || !hasBackendSession()) {
+    navigateTo('index.html');
+    return;
   }
   await initGame();
 });

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>情景体验研究</title>
-  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/style.css?v=20261124">
 </head>
 <body>
   <div class="container">
@@ -31,7 +31,7 @@
         <input id="participantIdInput" class="form-input participant-id-input" type="text" placeholder="留空将自动生成编号" autocomplete="off">
       </div>
 
-      <button class="btn btn-primary btn-block btn-lg" onclick="startScenarioOnly()">
+      <button id="startScenarioBtn" class="btn btn-primary btn-block btn-lg" onclick="startScenarioOnly()">
         开始情景体验
       </button>
 
@@ -39,12 +39,12 @@
     </div>
   </div>
 
-  <script src="js/config.js"></script>
-  <script src="js/apiClient.js"></script>
-  <script src="js/mockData.js"></script>
-  <script src="js/storage.js"></script>
-  <script src="js/scoring.js"></script>
-  <script src="js/app.js"></script>
+  <script src="js/config.js?v=20261124"></script>
+  <script src="js/apiClient.js?v=20261124"></script>
+  <script src="js/mockData.js?v=20261124"></script>
+  <script src="js/storage.js?v=20261124"></script>
+  <script src="js/scoring.js?v=20261124"></script>
+  <script src="js/app.js?v=20261124"></script>
   <script>
     const SCENARIO_ONLY_GAME_KEY = 'game_a';
 
@@ -52,15 +52,39 @@
       return normalizeGameKey(getQueryParam('game') || SCENARIO_ONLY_GAME_KEY);
     }
 
+    var scenarioStartInProgress = false;
+
     async function startScenarioOnly() {
-      var customId = document.getElementById('participantIdInput') ? document.getElementById('participantIdInput').value.trim() : '';
-      await startParticipantSession(customId || undefined, { forceNew: true });
-      if (!hasBackendSession()) {
-        alert('后端连接失败，当前作答不会进入阿里云后台。请稍后重试，或先检查后端 API 是否可用。');
-        return;
+      if (scenarioStartInProgress) return;
+      var input = document.getElementById('participantIdInput');
+      var customId = input ? input.value.trim() : '';
+      var button = document.getElementById('startScenarioBtn');
+      scenarioStartInProgress = true;
+      if (button) { button.disabled = true; button.textContent = '正在连接，请稍候...'; }
+      try {
+        var options = { forceNew: true, requireBackend: true };
+        var result = await startParticipantSession(customId || undefined, options);
+        if (result && result.status === 'resume_available') {
+          if (!confirm('该编号有未完成的作答，是否继续？如需全新体验，请取消并使用新的编号。')) return;
+          result = await startParticipantSession(customId, {
+            forceNew: true, requireBackend: true, action: 'resume'
+          });
+        }
+        if (result && result.status === 'already_completed') {
+          alert('该编号已完成，请使用新的演示编号。');
+          return;
+        }
+        if (!hasBackendSession() || (result && typeof result === 'object')) {
+          throw new Error('会话尚未就绪，请稍后重试');
+        }
+        localStorage.setItem('scenario_only_game_key', JSON.stringify(getScenarioOnlyGameKey()));
+        navigateTo('game.html?game=' + encodeURIComponent(getScenarioOnlyGameKey()));
+      } catch (e) {
+        alert('进入失败：' + e.message + '。请稍后重试。');
+      } finally {
+        scenarioStartInProgress = false;
+        if (button) { button.disabled = false; button.textContent = '开始情景体验'; }
       }
-      localStorage.setItem('scenario_only_game_key', JSON.stringify(getScenarioOnlyGameKey()));
-      navigateTo('game.html?game=' + encodeURIComponent(getScenarioOnlyGameKey()));
     }
 
     document.addEventListener('DOMContentLoaded', function () {

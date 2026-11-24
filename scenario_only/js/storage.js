@@ -8,6 +8,7 @@ const STORAGE_KEYS = {
   PARTICIPANT_CODE: 'participant_code',
   EXTERNAL_ID: 'external_id',
   BACKEND_SESSION_ACTIVE: 'backend_session_active',
+  COMPLETION_STATUS: 'completion_status',
   START_TIME: 'start_time',
   QUESTIONNAIRE_START_TIME: 'questionnaire_start_time',
   QUESTIONNAIRE_END_TIME: 'questionnaire_end_time',
@@ -21,8 +22,15 @@ const STORAGE_KEYS = {
   GAME_REPORTS: 'game_reports',
   QUESTIONNAIRE_RESPONSES: 'questionnaire_responses',
   GAME_RESPONSES: 'game_responses',
-  RESULT_SCORES: 'result_scores'
+  RESULT_SCORES: 'result_scores',
+  FLOW_ENABLED: 'flow_enabled',
+  FLOW_PLAN: 'flow_plan',
+  CURRENT_FLOW_STEP: 'current_flow_step',
+  CURRENT_FLOW_INDEX: 'current_flow_index',
+  FLOW_COMPLETED_STEP_IDS: 'flow_completed_step_ids'
 };
+
+const START_PARTICIPANT_TIMEOUT_MS = 60000;
 
 // ---- Helpers ----
 function _getItem(key) {
@@ -41,6 +49,15 @@ function _removeItem(key) {
   localStorage.removeItem(key);
 }
 
+function _clearKeysByPrefix(prefix) {
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.indexOf(prefix) === 0) keys.push(key);
+  }
+  keys.forEach(key => _removeItem(key));
+}
+
 // ============================================================
 // 参与者会话
 // ============================================================
@@ -51,34 +68,83 @@ function _removeItem(key) {
  * 优先调用后端 API，回退到 localStorage
  * TODO: 后续可移除 localStorage 回退
  */
+function applyParticipantSession(result, externalId) {
+  _setItem(STORAGE_KEYS.PARTICIPANT_ID, result.participant_id);
+  _setItem(STORAGE_KEYS.PARTICIPANT_CODE, result.participant_code || '');
+  _setItem(STORAGE_KEYS.EXTERNAL_ID, result.external_id || externalId || '');
+  _setItem(STORAGE_KEYS.BACKEND_SESSION_ACTIVE, true);
+  _setItem(STORAGE_KEYS.COMPLETION_STATUS, result.completion_status || '');
+  _setItem(STORAGE_KEYS.START_TIME, result.start_time || new Date().toISOString());
+  _setItem(STORAGE_KEYS.GAME_ORDER, normalizeGameOrder(result.game_order));
+  _setItem(STORAGE_KEYS.CURRENT_GAME_INDEX, 0);
+  _setItem(STORAGE_KEYS.COMPLETED_GAME_KEYS, result.completed_game_keys || []);
+  _setItem(STORAGE_KEYS.GAME_REPORTS, result.game_reports || {});
+  _setItem(STORAGE_KEYS.QUESTIONNAIRE_RESPONSES, result.questionnaire_responses || []);
+  _setItem(STORAGE_KEYS.GAME_RESPONSES, result.game_responses || []);
+  _setItem(STORAGE_KEYS.FLOW_ENABLED, result.flow_enabled === true);
+  _setItem(STORAGE_KEYS.CURRENT_FLOW_STEP, result.current_step || null);
+  _setItem(STORAGE_KEYS.CURRENT_FLOW_INDEX, result.current_flow_index || 0);
+  _setItem(STORAGE_KEYS.FLOW_COMPLETED_STEP_IDS, result.flow_completed_step_ids || []);
+  _setItem(STORAGE_KEYS.FLOW_PLAN, result.flow_plan || (result.current_step ? [result.current_step] : []));
+  return result.participant_id;
+}
+
+function normalizeExternalId(value) {
+  return String(value || '').trim();
+}
+
+function isCachedParticipantSessionFinished() {
+  const status = _getItem(STORAGE_KEYS.COMPLETION_STATUS);
+  if (status === 'completed' || status === 'abandoned') return true;
+
+  const currentStep = _getItem(STORAGE_KEYS.CURRENT_FLOW_STEP);
+  if (_getItem(STORAGE_KEYS.FLOW_ENABLED) === true && currentStep && currentStep.type === 'complete') {
+    return true;
+  }
+
+  if (_getItem(STORAGE_KEYS.FLOW_ENABLED) !== true &&
+      _getItem(STORAGE_KEYS.QUESTIONNAIRE_COMPLETED) === true &&
+      _getItem(STORAGE_KEYS.GAME_COMPLETED) === true) {
+    return true;
+  }
+
+  return false;
+}
+
 async function startParticipantSession(customId, options) {
   options = options || {};
-  if (options.forceNew) {
+  const action = options.action ? String(options.action) : '';
+  const externalId = normalizeExternalId(customId);
+
+  // 仅在编号一致时复用现有后端会话，避免输入新编号却跳回旧作答/旧报告。
+  const existingId = _getItem(STORAGE_KEYS.PARTICIPANT_ID);
+  const existingExternalId = normalizeExternalId(_getItem(STORAGE_KEYS.EXTERNAL_ID));
+  const sameExternalId = !externalId || (existingExternalId && externalId === existingExternalId);
+  if (existingId && hasBackendSession() && action !== 'restart' && sameExternalId && !isCachedParticipantSessionFinished()) {
+    return existingId;
+  }
+
+  if (options.forceNew || action === 'restart') {
     clearParticipantData();
   }
 
-  // 如果已有会话则复用
-  const existingId = _getItem(STORAGE_KEYS.PARTICIPANT_ID);
-  if (existingId) return existingId;
-
-  const externalId = customId && customId.trim() ? customId.trim() : '';
-
   // 尝试调用后端 API。成功后必须使用后端返回的 participant_id。
   try {
-    const result = await apiPost('/participants/start', { external_id: externalId });
-    _setItem(STORAGE_KEYS.PARTICIPANT_ID, result.participant_id);
-    _setItem(STORAGE_KEYS.PARTICIPANT_CODE, result.participant_code || '');
-    _setItem(STORAGE_KEYS.EXTERNAL_ID, externalId);
-    _setItem(STORAGE_KEYS.BACKEND_SESSION_ACTIVE, true);
-    _setItem(STORAGE_KEYS.START_TIME, result.start_time);
-    _setItem(STORAGE_KEYS.GAME_ORDER, normalizeGameOrder(result.game_order));
-    _setItem(STORAGE_KEYS.CURRENT_GAME_INDEX, 0);
-    _setItem(STORAGE_KEYS.COMPLETED_GAME_KEYS, []);
-    _setItem(STORAGE_KEYS.GAME_REPORTS, {});
-    console.log('[storage] 后端创建参与者成功:', result.participant_id, result.participant_code || '');
-    return result.participant_id;
+    const body = { external_id: externalId };
+    if (action) body.action = action;
+    const result = await apiPost('/participants/start', body, {
+      timeout: START_PARTICIPANT_TIMEOUT_MS,
+      retries: 0
+    });
+    if (result.status === 'resume_available' || result.status === 'already_completed') {
+      return result;
+    }
+    const readyParticipantId = applyParticipantSession(result, externalId);
+    console.log('[storage] 后端参与者会话就绪:', result.status || 'created', readyParticipantId, result.participant_code || '');
+    return readyParticipantId;
   } catch (e) {
-    console.warn('[storage] 后端不可用，使用本地模式:', e.message);
+    console.warn('[storage] 创建会话失败:', e.message);
+    if (options.requireBackend) throw e;
   }
 
   // 回退：localStorage 本地生成
@@ -95,6 +161,9 @@ async function startParticipantSession(customId, options) {
   _setItem(STORAGE_KEYS.CURRENT_GAME_INDEX, 0);
   _setItem(STORAGE_KEYS.COMPLETED_GAME_KEYS, []);
   _setItem(STORAGE_KEYS.GAME_REPORTS, {});
+  _setItem(STORAGE_KEYS.FLOW_ENABLED, false);
+  _setItem(STORAGE_KEYS.CURRENT_FLOW_STEP, null);
+  _setItem(STORAGE_KEYS.FLOW_PLAN, []);
   return participantId;
 }
 
@@ -111,11 +180,16 @@ function getParticipantLabel() {
 
 function normalizeGameKey(key) {
   key = String(key || '').trim().toLowerCase();
+  key = key.replace(/\s+/g, '_');
+  if (!key) return 'game_a';
+  if (key === 'a' || key === 'gamea') return 'game_a';
   if (key === 'game_b' || key === 'b' || key === 'gameb') return 'game_b';
-  return 'game_a';
+  return key;
 }
 
 function defaultGameTitle(key) {
+  const normalized = normalizeGameKey(key);
+  if (normalized !== 'game_a' && normalized !== 'game_b') return normalized;
   return normalizeGameKey(key) === 'game_b' ? '情景游戏B' : '情景游戏A';
 }
 
@@ -126,10 +200,7 @@ function normalizeGameOrder(order) {
     const k = normalizeGameKey(key);
     if (normalized.indexOf(k) === -1) normalized.push(k);
   });
-  ['game_a', 'game_b'].forEach(function (key) {
-    if (normalized.indexOf(key) === -1) normalized.push(key);
-  });
-  return normalized.slice(0, 2);
+  return normalized.length ? normalized : ['game_a', 'game_b'];
 }
 
 async function ensureGameOrder() {
@@ -197,6 +268,80 @@ async function getGameReports() {
 }
 
 // ============================================================
+// Flow
+// ============================================================
+
+async function getCurrentFlow() {
+  const participantId = _getItem(STORAGE_KEYS.PARTICIPANT_ID);
+  if (!participantId || !hasBackendSession()) {
+    return { flow_enabled: false, current_step: null, flow_plan: [] };
+  }
+
+  try {
+    const result = await apiGet('/flow/current/' + encodeURIComponent(participantId));
+    _setItem(STORAGE_KEYS.FLOW_ENABLED, result.flow_enabled === true);
+    _setItem(STORAGE_KEYS.CURRENT_FLOW_STEP, result.current_step || null);
+    _setItem(STORAGE_KEYS.CURRENT_FLOW_INDEX, result.current_flow_index || 0);
+    _setItem(STORAGE_KEYS.FLOW_PLAN, result.flow_plan || []);
+    _setItem(STORAGE_KEYS.FLOW_COMPLETED_STEP_IDS, result.flow_completed_step_ids || []);
+    if (result.flow_enabled && Array.isArray(result.flow_plan)) {
+      const gameOrder = result.flow_plan
+        .filter(function (step) { return step && step.type === 'game' && step.game_key; })
+        .map(function (step) { return normalizeGameKey(step.game_key); });
+      if (gameOrder.length) _setItem(STORAGE_KEYS.GAME_ORDER, normalizeGameOrder(gameOrder));
+    }
+    return result;
+  } catch (e) {
+    console.warn('[storage] 鑾峰彇瀹為獙娴佺▼澶辫触锛屼娇鐢ㄦ棫娴佺▼:', e.message);
+    return { flow_enabled: false, current_step: null, flow_plan: [] };
+  }
+}
+
+async function completeFlowStep(stepId) {
+  const participantId = _getItem(STORAGE_KEYS.PARTICIPANT_ID);
+  if (!participantId || !hasBackendSession() || !stepId) {
+    return { flow_enabled: false, next_step: null };
+  }
+  const result = await apiPost('/flow/complete-step', {
+    participant_id: participantId,
+    step_id: stepId
+  });
+  _setItem(STORAGE_KEYS.CURRENT_FLOW_STEP, result.next_step || null);
+  if (result && result.completion_status) {
+    _setItem(STORAGE_KEYS.COMPLETION_STATUS, result.completion_status);
+  }
+  return result;
+}
+
+function flowStepUrl(step) {
+  if (!step || !step.type) return 'result.html?complete=1';
+  const params = new URLSearchParams();
+  if (step.step_id) params.set('step_id', step.step_id);
+  if (step.block_id) params.set('block_id', step.block_id);
+  if (step.game_key) params.set('game', normalizeGameKey(step.game_key));
+
+  if (step.type === 'questionnaire') return 'questionnaire.html?' + params.toString();
+  if (step.type === 'game') return 'game.html?' + params.toString();
+  if (step.type === 'report') return 'result.html?' + params.toString();
+  if (step.type === 'complete') return 'result.html?complete=1' + (step.step_id ? '&step_id=' + encodeURIComponent(step.step_id) : '');
+  return 'result.html?complete=1';
+}
+
+function navigateToFlowStep(step) {
+  navigateTo(flowStepUrl(step));
+}
+
+async function navigateToCurrentFlowOrFallback(fallbackUrl) {
+  const flow = await getCurrentFlow();
+  if (flow.flow_enabled && flow.current_step) {
+    navigateToFlowStep(flow.current_step);
+    return true;
+  }
+  navigateTo(fallbackUrl || 'questionnaire.html');
+  return false;
+}
+
+// ============================================================
 // 问卷
 // ============================================================
 
@@ -210,7 +355,15 @@ async function saveQuestionnaireResponse(data) {
   data.external_id = data.external_id || _getItem(STORAGE_KEYS.EXTERNAL_ID) || '';
   // 始终保存到 localStorage（离线可用）
   const responses = _getItem(STORAGE_KEYS.QUESTIONNAIRE_RESPONSES) || [];
-  const existingIndex = responses.findIndex(r => r.question_id === data.question_id);
+  const contextKey = function (item) {
+    return [
+      item.question_id || '',
+      item.step_id || '',
+      item.block_id || '',
+      normalizeGameKey(item.game_key || '')
+    ].join('::');
+  };
+  const existingIndex = responses.findIndex(r => contextKey(r) === contextKey(data));
   if (existingIndex !== -1) {
     responses[existingIndex] = data;
   } else {
@@ -223,6 +376,10 @@ async function saveQuestionnaireResponse(data) {
     participant_id: data.participant_id,
     participant_code: _getItem(STORAGE_KEYS.PARTICIPANT_CODE) || '',
     question_id: data.question_id,
+    step_id: data.step_id || '',
+    block_id: data.block_id || '',
+    game_key: data.game_key ? normalizeGameKey(data.game_key) : '',
+    game_title: data.game_title || '',
     question_type: data.question_type || '',
     response_time_seconds: data.response_time_seconds || 0,
     raw_score: data.raw_score || 0,
@@ -248,17 +405,31 @@ async function saveQuestionnaireResponse(data) {
 /**
  * 标记问卷完成
  */
-async function completeQuestionnaire() {
+async function completeQuestionnaire(context) {
+  context = context || {};
   const participantId = _getItem(STORAGE_KEYS.PARTICIPANT_ID);
   if (!participantId) return { status: 'no_participant' };
 
+  let result = { status: 'local_only' };
   if (hasBackendSession()) {
-    await apiPost('/questionnaire/complete', { participant_id: participantId });
+    result = await apiPost('/questionnaire/complete', {
+      participant_id: participantId,
+      step_id: context.step_id || '',
+      block_id: context.block_id || '',
+      game_key: context.game_key ? normalizeGameKey(context.game_key) : '',
+      game_title: context.game_title || ''
+    });
+    if (result && result.next_step) {
+      _setItem(STORAGE_KEYS.CURRENT_FLOW_STEP, result.next_step);
+    }
+    if (result && result.completion_status) {
+      _setItem(STORAGE_KEYS.COMPLETION_STATUS, result.completion_status);
+    }
   }
 
   _setItem(STORAGE_KEYS.QUESTIONNAIRE_END_TIME, new Date().toISOString());
   _setItem(STORAGE_KEYS.QUESTIONNAIRE_COMPLETED, true);
-  return { status: hasBackendSession() ? 'synced' : 'local_only' };
+  return result || { status: hasBackendSession() ? 'synced' : 'local_only' };
 }
 
 // ============================================================
@@ -322,7 +493,8 @@ async function saveGameResponse(data) {
  * 标记游戏完成 — 本地计分 + 后端通知（不阻塞）
  * 返回结果包含 dimension_scores
  */
-async function completeGame(gameKey, gameTitle) {
+async function completeGame(gameKey, gameTitle, context) {
+  context = context || {};
   var participantId = _getItem(STORAGE_KEYS.PARTICIPANT_ID);
   if (!participantId) return null;
 
@@ -334,16 +506,22 @@ async function completeGame(gameKey, gameTitle) {
     scores = await apiPost('/game/complete', {
       participant_id: participantId,
       game_key: gameKey,
-      game_title: gameTitle
+      game_title: gameTitle,
+      step_id: context.step_id || ''
     });
+    if (scores && scores.next_step) {
+      _setItem(STORAGE_KEYS.CURRENT_FLOW_STEP, scores.next_step);
+    }
+    if (scores && scores.completion_status) {
+      _setItem(STORAGE_KEYS.COMPLETION_STATUS, scores.completion_status);
+    }
   } else {
     scores = calculateGameScores(gameKey, gameTitle);
   }
 
   _setItem(STORAGE_KEYS.GAME_END_TIME, new Date().toISOString());
-  if (scores) {
-    saveGameReport(gameKey, scores);
-    saveResultScores(scores);
+  if (scores && scores.dimension_scores) {
+    saveResultScores(scores.dimension_scores);
   }
   const completed = markGameKeyCompleted(gameKey);
   const order = normalizeGameOrder(_getItem(STORAGE_KEYS.GAME_ORDER));
@@ -396,6 +574,7 @@ function getParticipantData() {
     participant_code: _getItem(STORAGE_KEYS.PARTICIPANT_CODE),
     external_id: _getItem(STORAGE_KEYS.EXTERNAL_ID),
     backend_session_active: _getItem(STORAGE_KEYS.BACKEND_SESSION_ACTIVE),
+    completion_status: _getItem(STORAGE_KEYS.COMPLETION_STATUS),
     start_time: _getItem(STORAGE_KEYS.START_TIME),
     questionnaire_start_time: _getItem(STORAGE_KEYS.QUESTIONNAIRE_START_TIME),
     questionnaire_end_time: _getItem(STORAGE_KEYS.QUESTIONNAIRE_END_TIME),
@@ -409,7 +588,12 @@ function getParticipantData() {
     game_reports: _getItem(STORAGE_KEYS.GAME_REPORTS) || {},
     questionnaire_responses: _getItem(STORAGE_KEYS.QUESTIONNAIRE_RESPONSES) || [],
     game_responses: _getItem(STORAGE_KEYS.GAME_RESPONSES) || [],
-    result_scores: _getItem(STORAGE_KEYS.RESULT_SCORES)
+    result_scores: _getItem(STORAGE_KEYS.RESULT_SCORES),
+    flow_enabled: _getItem(STORAGE_KEYS.FLOW_ENABLED),
+    flow_plan: _getItem(STORAGE_KEYS.FLOW_PLAN) || [],
+    current_flow_step: _getItem(STORAGE_KEYS.CURRENT_FLOW_STEP),
+    current_flow_index: _getItem(STORAGE_KEYS.CURRENT_FLOW_INDEX),
+    flow_completed_step_ids: _getItem(STORAGE_KEYS.FLOW_COMPLETED_STEP_IDS) || []
   };
 }
 
@@ -418,4 +602,5 @@ function getParticipantData() {
  */
 function clearParticipantData() {
   Object.values(STORAGE_KEYS).forEach(key => _removeItem(key));
+  _clearKeysByPrefix('questionnaire_completed::');
 }
